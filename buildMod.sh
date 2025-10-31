@@ -9,7 +9,7 @@ export PATH=${CLANG_PATH}:${PATH}
 
 make clean
 make CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump
-adb push hello.ko /sdcard/
-adb shell su -c rmmod hello
-adb shell su -c insmod /sdcard/hello.ko
-adb shell su -c dmesg -c
+adb push mod.ko /sdcard/
+adb shell su -c rmmod mod
+adb shell su -c insmod /sdcard/mod.ko
+adb shell su -c dmesg -c | grep MEMS

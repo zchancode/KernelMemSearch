@@ -1,0 +1,1 @@
+cmd_/mnt/work/hack/KernelMemSearch/mod.ko := ld.lld -r  -maarch64linux -O2 -T ./scripts/module-common.lds -T ./arch/arm64/kernel/module.lds  --build-id  -o /mnt/work/hack/KernelMemSearch/mod.ko /mnt/work/hack/KernelMemSearch/mod.o /mnt/work/hack/KernelMemSearch/mod.mod.o ;  true
