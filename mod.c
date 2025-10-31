@@ -22,6 +22,7 @@ MODULE_DESCRIPTION("Enhanced memory scanner with read/write interface");
 #define MEMSCAN_IOCTL_MAGIC 'M'
 #define MEMSCAN_SEARCH _IOWR(MEMSCAN_IOCTL_MAGIC, 1, struct search_request)
 #define MEMSCAN_READ _IOWR(MEMSCAN_IOCTL_MAGIC, 2, struct read_request)
+#define WILDCARD_BYTE 0xFF  // 通配符字节
 
 static char* tag = "MEMSCAN: ";
 static int major_num;
@@ -108,6 +109,22 @@ static phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
     return page_addr + page_offset;
 }
 
+static bool pattern_match_with_wildcards(const unsigned char *data,
+                                        const unsigned char *pattern,
+                                        size_t len)
+{
+    size_t i;
+    for (i = 0; i < len; i++) {
+        if (pattern[i] == WILDCARD_BYTE) {
+            continue;  // 通配符，跳过比较
+        }
+        if (data[i] != pattern[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void search_page(struct mm_struct *mm, unsigned long vaddr,
                        struct search_params *params)
 {
@@ -142,7 +159,7 @@ static void search_page(struct mm_struct *mm, unsigned long vaddr,
         if (params->found_count >= params->max_results)
             break;
 
-        if (memcmp(page_buf + i, params->pattern, params->pattern_len) == 0) {
+        if (pattern_match_with_wildcards(page_buf + i, params->pattern, params->pattern_len)) {
             params->results[params->found_count++] = page_start + i;
         }
     }
@@ -448,6 +465,7 @@ static int __init memscanner_init(void)
     }
 
     printk(KERN_INFO "%s Device initialized with major number %d\n", tag, major_num);
+    printk(KERN_INFO "%s Wildcard support enabled, use 0xFF as wildcard byte\n", tag);
     return 0;
 }
 
