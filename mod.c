@@ -11,41 +11,26 @@
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/uaccess.h>
+#include <asm/pgtable.h>
+#include <asm/page.h>
+#include <linux/hugetlb.h>
+
+
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Your Name");
-MODULE_DESCRIPTION("Enhanced memory scanner with read/write interface");
+MODULE_DESCRIPTION("Memory reader with read interface");
 
-#define DEVICE_NAME "memscan"
-#define MAX_RESULTS 1000
+#define DEVICE_NAME "memread"
 #define MAX_READ_SIZE PAGE_SIZE
-#define MEMSCAN_IOCTL_MAGIC 'M'
-#define MEMSCAN_SEARCH _IOWR(MEMSCAN_IOCTL_MAGIC, 1, struct search_request)
-#define MEMSCAN_READ _IOWR(MEMSCAN_IOCTL_MAGIC, 2, struct read_request)
-#define WILDCARD_BYTE 0xFF  // 通配符字节
+#define MEMREAD_IOCTL_MAGIC 'M'
+#define MEMREAD_READ _IOWR(MEMREAD_IOCTL_MAGIC, 1, struct read_request)
 
-static char* tag = "MEMSCAN: ";
+static char* tag = "MEMREAD: ";
 static int major_num;
-static struct class* memscan_class = NULL;
-static struct device* memscan_device = NULL;
-static struct cdev memscan_cdev;
-
-struct search_params {
-    unsigned char *pattern;
-    size_t pattern_len;
-    unsigned long *results;
-    size_t max_results;
-    size_t found_count;
-};
-
-struct search_request {
-    pid_t pid;
-    unsigned long pattern_addr;
-    size_t pattern_len;
-    unsigned long results_addr;
-    size_t max_results;
-    size_t found_count;
-};
+static struct class* memread_class = NULL;
+static struct device* memread_device = NULL;
+static struct cdev memread_cdev;
 
 struct read_request {
     pid_t pid;
@@ -55,21 +40,62 @@ struct read_request {
     int status;
 };
 
-static bool read_phys_mem(phys_addr_t pa, void *buf, size_t size)
+static bool read_phys_mem(phys_addr_t pa, void __user *buf, size_t size)
 {
     void __iomem *mapped;
     bool ret = true;
 
-    mapped = ioremap_cache(pa, size);
-    if (!mapped) {
-        printk(KERN_WARNING "%s: Failed to ioremap PA 0x%llx\n", tag, (u64)pa);
-        return false;
+    printk(KERN_INFO "%s: [PHYS_MEM] Start: pa=0x%llx, size=%zu\n",
+    tag, (u64)pa, size);
+
+    if (size == 0 || size > MAX_READ_SIZE) {
+    printk(KERN_ERR "%s: [PHYS_MEM] Invalid size: %zu\n", tag, size);
+    return false;
     }
 
-    memcpy_fromio(buf, mapped, size);
+    if (pa & (sizeof(void *)-1)) {
+    printk(KERN_WARNING "%s: [PHYS_MEM] Unaligned address: 0x%llx\n", tag, (u64)pa);
+    }
+
+    if (!pfn_valid(__phys_to_pfn(pa))) {
+    printk(KERN_ERR "%s: [PHYS_MEM] Invalid pfn for pa 0x%llx\n", tag, (u64)pa);
+    return false;
+    }
+
+    printk(KERN_INFO "%s: [PHYS_MEM] Before ioremap_cache\n", tag);
+    mapped = ioremap_cache(pa, size);
+    if (!mapped) {
+    printk(KERN_ERR "%s: [PHYS_MEM] ioremap_cache failed\n", tag);
+    return false;
+    }
+    printk(KERN_INFO "%s: [PHYS_MEM] ioremap_cache succeeded: %p\n", tag, mapped);
+
+    printk(KERN_INFO "%s: [PHYS_MEM] Before copy_to_user\n", tag);
+    if (copy_to_user(buf, mapped, size)) {
+    printk(KERN_ERR "%s: [PHYS_MEM] copy_to_user failed\n", tag);
+    ret = false;
+    } else {
+    printk(KERN_INFO "%s: [PHYS_MEM] copy_to_user succeeded\n", tag);
+    }
+
+    printk(KERN_INFO "%s: [PHYS_MEM] Before iounmap\n", tag);
     iounmap(mapped);
+    printk(KERN_INFO "%s: [PHYS_MEM] After iounmap\n", tag);
+
+    printk(KERN_INFO "%s: [PHYS_MEM] Completed: %s\n", tag, ret ? "success" : "failed");
     return ret;
 }
+
+
+static bool read_phys_mem_direct(phys_addr_t pa, void __user *buf, size_t size)
+{
+    #if defined(CONFIG_ARCH_HAS_DIRECT_PHYS_ACCESS)
+    return (copy_from_phys_to_user(buf, pa, size) == 0);
+    #else
+    return read_phys_mem(pa, buf, size);
+    #endif
+}
+
 
 static phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
 {
@@ -93,9 +119,21 @@ static phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
     if (pud_none(*pud) || pud_bad(*pud))
         return 0;
 
+    //pud -> huge page 1G
+    if (pud_huge(*pud)) {
+        printk(KERN_ERR "%s: pud huge page\n", tag);
+        return 0;
+    }
+
     pmd = pmd_offset(pud, va);
     if (pmd_none(*pmd))
         return 0;
+
+    //pmd -> huge page 2M
+    if (pmd_huge(*pmd) || pmd_trans_huge(*pmd)) {
+        printk(KERN_ERR "%s: pmd huge page\n", tag);
+        return 0;
+    }
 
     pte = pte_offset_kernel(pmd, va);
     if (pte_none(*pte))
@@ -109,120 +147,14 @@ static phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
     return page_addr + page_offset;
 }
 
-static bool pattern_match_with_wildcards(const unsigned char *data,
-                                        const unsigned char *pattern,
-                                        size_t len)
-{
-    size_t i;
-    for (i = 0; i < len; i++) {
-        if (pattern[i] == WILDCARD_BYTE) {
-            continue;  // 通配符，跳过比较
-        }
-        if (data[i] != pattern[i]) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static void search_page(struct mm_struct *mm, unsigned long vaddr,
-                       struct search_params *params)
-{
-    phys_addr_t phys_addr;
-    unsigned char *page_buf = NULL;
-
-    if (params->found_count >= params->max_results)
-        return;
-
-    if (vaddr >= TASK_SIZE) {
-        return;
-    }
-
-    phys_addr = translate_linear_address(mm, vaddr);
-    if (!phys_addr) {
-        return;
-    }
-
-    page_buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
-    if (!page_buf) {
-        return;
-    }
-
-    if (!read_phys_mem(phys_addr, page_buf, PAGE_SIZE)) {
-        kfree(page_buf);
-        return;
-    }
-
-    unsigned long page_start = vaddr & PAGE_MASK;
-    int i;
-    for (i = 0; i <= PAGE_SIZE - params->pattern_len; i++) {
-        if (params->found_count >= params->max_results)
-            break;
-
-        if (pattern_match_with_wildcards(page_buf + i, params->pattern, params->pattern_len)) {
-            params->results[params->found_count++] = page_start + i;
-        }
-    }
-
-    kfree(page_buf);
-}
-
-static void search_process_memory(struct mm_struct *mm, struct search_params *params)
-{
-    struct vm_area_struct *vma;
-
-    if (!mm) {
-        printk(KERN_ERR "%s: mm is NULL!\n", tag);
-        return;
-    }
-
-    if (!down_read_trylock(&mm->mmap_sem)) {
-        printk(KERN_WARNING "%s: Could not acquire mmap_sem\n", tag);
-        return;
-    }
-
-    if (!mm->mmap) {
-        up_read(&mm->mmap_sem);
-        printk(KERN_WARNING "%s: No VMAs found\n", tag);
-        return;
-    }
-
-    for (vma = mm->mmap; vma && params->found_count < params->max_results; vma = vma->vm_next) {
-        unsigned long addr;
-
-        if (!(vma->vm_flags & VM_READ))
-            continue;
-
-        if (vma->vm_start >= TASK_SIZE || vma->vm_end > TASK_SIZE)
-            continue;
-
-        for (addr = vma->vm_start;
-             addr < vma->vm_end && params->found_count < params->max_results;
-             addr += PAGE_SIZE) {
-            search_page(mm, addr, params);
-        }
-    }
-
-    up_read(&mm->mmap_sem);
-}
-
 static int read_process_memory(struct read_request *req)
 {
     struct task_struct *task = NULL;
     phys_addr_t phys_addr;
-    unsigned char *kernel_buf = NULL;
+    size_t remaining;
+    uintptr_t current_va;
+    void __user *current_buf;
     int ret = 0;
-
-    if (req->size == 0 || req->size > MAX_READ_SIZE) {
-        printk(KERN_WARNING "%s: Invalid read size %zu\n", tag, req->size);
-        return -EINVAL;
-    }
-
-    kernel_buf = kmalloc(req->size, GFP_KERNEL);
-    if (!kernel_buf) {
-        printk(KERN_ERR "%s: Failed to allocate read buffer\n", tag);
-        return -ENOMEM;
-    }
 
     rcu_read_lock();
     task = pid_task(find_pid_ns(req->pid, &init_pid_ns), PIDTYPE_PID);
@@ -243,152 +175,55 @@ static int read_process_memory(struct read_request *req)
         goto out_cleanup;
     }
 
-    phys_addr = translate_linear_address(task->mm, req->vaddr);
-    if (!phys_addr) {
-        printk(KERN_ERR "%s: Failed to translate VA 0x%lx\n", tag, req->vaddr);
-        ret = -EFAULT;
-        goto out_cleanup;
-    }
+    remaining = req->size;
+    current_va = req->vaddr;
+    current_buf = (void __user *)req->buffer_addr;
 
-    if (!read_phys_mem(phys_addr, kernel_buf, req->size)) {
-        printk(KERN_ERR "%s: Failed to read memory at VA 0x%lx\n", tag, req->vaddr);
-        ret = -EFAULT;
-        goto out_cleanup;
-    }
-
-    if (copy_to_user((void __user *)req->buffer_addr, kernel_buf, req->size)) {
-        printk(KERN_ERR "%s: Failed to copy to user buffer\n", tag);
-        ret = -EFAULT;
-        goto out_cleanup;
-    }
-
-    req->status = 0;
-    printk(KERN_DEBUG "%s: Read %zu bytes from PID %d at VA 0x%lx\n",
-           tag, req->size, req->pid, req->vaddr);
-
-out_cleanup:
-    if (kernel_buf)
-        kfree(kernel_buf);
-    if (task)
-        put_task_struct(task);
-
-    return ret;
-}
-
-static int search_process(struct search_request *req)
-{
-    struct task_struct *task = NULL;
-    struct search_params params;
-    unsigned char *pattern = NULL;
-    unsigned long *results = NULL;
-    int ret = 0;
-
-    pattern = kmalloc(req->pattern_len, GFP_KERNEL);
-    if (!pattern) {
-        ret = -ENOMEM;
-        goto out_cleanup;
-    }
-
-    results = kmalloc_array(req->max_results, sizeof(unsigned long), GFP_KERNEL);
-    if (!results) {
-        ret = -ENOMEM;
-        goto out_cleanup;
-    }
-
-    if (copy_from_user(pattern, (void __user *)req->pattern_addr, req->pattern_len)) {
-        ret = -EFAULT;
-        goto out_cleanup;
-    }
-
-    rcu_read_lock();
-    task = pid_task(find_pid_ns(req->pid, &init_pid_ns), PIDTYPE_PID);
-    if (task) {
-        get_task_struct(task);
-    }
-    rcu_read_unlock();
-
-    if (!task) {
-        printk(KERN_ERR "%s Can't find process PID: %d\n", tag, req->pid);
-        ret = -ESRCH;
-        goto out_cleanup;
-    }
-
-    if (!task->mm) {
-        printk(KERN_ERR "%s: Process has no memory context\n", tag);
-        ret = -EFAULT;
-        goto out_cleanup;
-    }
-
-    printk(KERN_DEBUG "%s Searching PID=%d, name=%s, pattern_len=%zu, max_results=%zu\n",
-           tag, req->pid, task->comm, req->pattern_len, req->max_results);
-
-    params.pattern = pattern;
-    params.pattern_len = req->pattern_len;
-    params.results = results;
-    params.max_results = req->max_results;
-    params.found_count = 0;
-
-    search_process_memory(task->mm, &params);
-
-    req->found_count = params.found_count;
-    printk(KERN_DEBUG "%s Found %zu matches\n", tag, params.found_count);
-
-    if (req->found_count > 0) {
-        if (copy_to_user((void __user *)req->results_addr, results,
-                        params.found_count * sizeof(unsigned long))) {
+    printk(KERN_ERR "%s request pid: %d start: %x size: %d\n", tag, req->pid,req->vaddr,req->size);
+    while (remaining > 0) {
+        printk(KERN_ERR "%s remaining: %d\n", tag, remaining);
+        size_t bytes_in_page, chunk_size;
+        bytes_in_page = PAGE_SIZE - (current_va & (PAGE_SIZE - 1));
+        chunk_size = (remaining < bytes_in_page) ? remaining : bytes_in_page;
+        if (!phys_addr) {
+            printk(KERN_ERR "%s: Failed to translate VA 0x%lx at offset %zu\n",
+                    tag, current_va, req->size - remaining);
             ret = -EFAULT;
             goto out_cleanup;
         }
+        if (!read_phys_mem_direct(phys_addr, current_buf, chunk_size)) {
+            printk(KERN_ERR "%s: Failed to read memory at VA 0x%lx, size %zu\n",
+                    tag, current_va, chunk_size);
+            ret = -EFAULT;
+            goto out_cleanup;
+        }
+        remaining -= chunk_size;
+        current_va += chunk_size;
+        current_buf += chunk_size;
     }
 
-    ret = 0;
+    req->status = 0;
+    printk(KERN_DEBUG "%s: Successfully read %zu bytes from PID %d at VA 0x%lx\n",
+            tag, req->size, req->pid, req->vaddr);
 
-out_cleanup:
-    if (pattern)
-        kfree(pattern);
-    if (results)
-        kfree(results);
+    out_cleanup:
     if (task)
         put_task_struct(task);
 
     return ret;
 }
 
-static long memscan_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+
+static long memread_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     int ret = 0;
 
-    if (_IOC_TYPE(cmd) != MEMSCAN_IOCTL_MAGIC) {
+    if (_IOC_TYPE(cmd) != MEMREAD_IOCTL_MAGIC) {
         return -ENOTTY;
     }
 
     switch (_IOC_NR(cmd)) {
         case 1: {
-            struct search_request req;
-
-            if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
-                return -EFAULT;
-            }
-
-            if (req.pattern_len == 0 || req.pattern_len > PAGE_SIZE) {
-                printk(KERN_WARNING "%s: Invalid pattern length: %zu\n", tag, req.pattern_len);
-                return -EINVAL;
-            }
-
-            if (req.max_results == 0 || req.max_results > MAX_RESULTS) {
-                printk(KERN_WARNING "%s: Invalid max results: %zu\n", tag, req.max_results);
-                return -EINVAL;
-            }
-
-            ret = search_process(&req);
-
-            if (copy_to_user((void __user *)arg, &req, sizeof(req))) {
-                return -EFAULT;
-            }
-            break;
-        }
-
-        case 2: {
             struct read_request req;
 
             if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
@@ -410,24 +245,24 @@ static long memscan_ioctl(struct file *file, unsigned int cmd, unsigned long arg
     return ret;
 }
 
-static int memscan_open(struct inode *inode, struct file *file)
+static int memread_open(struct inode *inode, struct file *file)
 {
     return 0;
 }
 
-static int memscan_release(struct inode *inode, struct file *file)
+static int memread_release(struct inode *inode, struct file *file)
 {
     return 0;
 }
 
-static const struct file_operations memscan_fops = {
-    .owner = THIS_MODULE,
-    .unlocked_ioctl = memscan_ioctl,
-    .open = memscan_open,
-    .release = memscan_release,
+static const struct file_operations memread_fops = {
+        .owner = THIS_MODULE,
+        .unlocked_ioctl = memread_ioctl,
+        .open = memread_open,
+        .release = memread_release,
 };
 
-static int __init memscanner_init(void)
+static int __init memreader_init(void)
 {
     dev_t dev = 0;
     int ret;
@@ -439,51 +274,50 @@ static int __init memscanner_init(void)
     }
     major_num = MAJOR(dev);
 
-    cdev_init(&memscan_cdev, &memscan_fops);
-    ret = cdev_add(&memscan_cdev, dev, 1);
+    cdev_init(&memread_cdev, &memread_fops);
+    ret = cdev_add(&memread_cdev, dev, 1);
     if (ret < 0) {
         printk(KERN_ERR "%s Failed to add cdev\n", tag);
         unregister_chrdev_region(dev, 1);
         return ret;
     }
 
-    memscan_class = class_create(THIS_MODULE, DEVICE_NAME);
-    if (IS_ERR(memscan_class)) {
+    memread_class = class_create(THIS_MODULE, DEVICE_NAME);
+    if (IS_ERR(memread_class)) {
         printk(KERN_ERR "%s Failed to create device class\n", tag);
-        cdev_del(&memscan_cdev);
+        cdev_del(&memread_cdev);
         unregister_chrdev_region(dev, 1);
-        return PTR_ERR(memscan_class);
+        return PTR_ERR(memread_class);
     }
 
-    memscan_device = device_create(memscan_class, NULL, dev, NULL, DEVICE_NAME);
-    if (IS_ERR(memscan_device)) {
+    memread_device = device_create(memread_class, NULL, dev, NULL, DEVICE_NAME);
+    if (IS_ERR(memread_device)) {
         printk(KERN_ERR "%s Failed to create device\n", tag);
-        class_destroy(memscan_class);
-        cdev_del(&memscan_cdev);
+        class_destroy(memread_class);
+        cdev_del(&memread_cdev);
         unregister_chrdev_region(dev, 1);
-        return PTR_ERR(memscan_device);
+        return PTR_ERR(memread_device);
     }
 
     printk(KERN_INFO "%s Device initialized with major number %d\n", tag, major_num);
-    printk(KERN_INFO "%s Wildcard support enabled, use 0xFF as wildcard byte\n", tag);
     return 0;
 }
 
-static void __exit memscanner_exit(void)
+static void __exit memreader_exit(void)
 {
     dev_t dev = MKDEV(major_num, 0);
 
-    if (memscan_device) {
-        device_destroy(memscan_class, dev);
+    if (memread_device) {
+        device_destroy(memread_class, dev);
     }
-    if (memscan_class) {
-        class_destroy(memscan_class);
+    if (memread_class) {
+        class_destroy(memread_class);
     }
-    cdev_del(&memscan_cdev);
+    cdev_del(&memread_cdev);
     unregister_chrdev_region(dev, 1);
 
     printk(KERN_INFO "%s Device unloaded\n", tag);
 }
 
-module_init(memscanner_init);
-module_exit(memscanner_exit);
+module_init(memreader_init);
+module_exit(memreader_exit);
